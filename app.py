@@ -1,97 +1,97 @@
-from flask import Flask, request, jsonify, render_template, send_file
-from flask_cors import CORS
 import os
-import tempfile
+import uuid
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 from werkzeug.utils import secure_filename
-from utils.pdf_parser import parse_pdfs_and_generate_timetable
-from utils.timetable_builder import generate_pdf
+from db import init_db, get_db
+from models import create_valentine, get_valentine
+import sqlite3
 
 app = Flask(__name__)
 CORS(app)
 
 # Configuration
-ALLOWED_EXTENSIONS = {'pdf'}
-MAX_FILE_SIZE = 16 * 1024 * 1024  # 16MB
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB limit
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+
+# Ensure upload directory exists
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Initialize database
+init_db()
 
 def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-@app.route('/')
-def home():
-    return jsonify({"message": "Personalized Timetable Generator API", "status": "running"})
-
-@app.route('/upload', methods=['POST'])
-def upload_files():
+@app.route('/api/create', methods=['POST'])
+def create_valentine_endpoint():
     try:
-        # Check if files are present
-        if 'faculty' not in request.files or 'formb' not in request.files:
-            return jsonify({"error": "Both faculty timetable and form B files are required"}), 400
+        # Generate unique ID
+        valentine_id = str(uuid.uuid4())[:8]
         
-        faculty_file = request.files['faculty']
-        formb_file = request.files['formb']
+        # Get message from form data
+        message = request.form.get('message', '')
         
-        # Check if files are selected
-        if faculty_file.filename == '' or formb_file.filename == '':
-            return jsonify({"error": "No files selected"}), 400
+        # Handle image uploads
+        images = request.files.getlist('images')
+        saved_images = []
         
-        if not (allowed_file(faculty_file.filename) and allowed_file(formb_file.filename)):
-            return jsonify({"error": "Only PDF files are allowed"}), 400
+        for image in images:
+            if image and allowed_file(image.filename):
+                # Generate unique filename
+                ext = image.filename.rsplit('.', 1)[1].lower()
+                filename = f"{valentine_id}_{uuid.uuid4()}.{ext}"
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                
+                # Save file
+                image.save(filepath)
+                saved_images.append(filename)
         
-        # Save files temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as faculty_temp:
-            faculty_file.save(faculty_temp.name)
-            faculty_path = faculty_temp.name
+        # Store in database
+        with get_db() as conn:
+            create_valentine(conn, valentine_id, message, saved_images)
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as formb_temp:
-            formb_file.save(formb_temp.name)
-            formb_path = formb_temp.name
-        
-        try:
-            # Process the PDFs
-            timetable_data = parse_pdfs_and_generate_timetable(faculty_path, formb_path)
-            
-            # Clean up temp files
-            os.unlink(faculty_path)
-            os.unlink(formb_path)
-            
-            return jsonify(timetable_data)
-            
-        except Exception as e:
-            # Clean up temp files in case of error
-            if os.path.exists(faculty_path):
-                os.unlink(faculty_path)
-            if os.path.exists(formb_path):
-                os.unlink(formb_path)
-            return jsonify({"error": f"Error processing PDFs: {str(e)}"}), 500
-            
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
-
-@app.route('/timetable', methods=['GET'])
-def view_timetable():
-    # This would typically get data from session or database
-    # For MVP, we'll return a template that can be populated via JS
-    return render_template('timetable.html')
-
-@app.route('/download', methods=['POST'])
-def download_timetable():
-    try:
-        timetable_data = request.json
-        if not timetable_data:
-            return jsonify({"error": "No timetable data provided"}), 400
-        
-        # Generate PDF
-        pdf_path = generate_pdf(timetable_data)
-        
-        return send_file(
-            pdf_path,
-            as_attachment=True,
-            download_name='personalized_timetable.pdf',
-            mimetype='application/pdf'
-        )
+        return jsonify({"id": valentine_id}), 201
         
     except Exception as e:
-        return jsonify({"error": f"Error generating PDF: {str(e)}"}), 500
+        print(f"Error creating valentine: {e}")
+        return jsonify({"error": "Failed to create Valentine"}), 500
+
+@app.route('/api/valentine/<valentine_id>', methods=['GET'])
+def get_valentine_endpoint(valentine_id):
+    try:
+        with get_db() as conn:
+            result = get_valentine(conn, valentine_id)
+            
+            if not result:
+                return jsonify({"message": "", "images": []}), 200
+            
+            valentine, images = result
+            
+            # Construct image URLs
+            image_urls = [f"/uploads/{img['filename']}" for img in images]
+            
+            return jsonify({
+                "message": valentine['message'] or "",
+                "images": image_urls
+            }), 200
+            
+    except Exception as e:
+        print(f"Error fetching valentine: {e}")
+        return jsonify({"error": "Failed to fetch Valentine"}), 500
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
